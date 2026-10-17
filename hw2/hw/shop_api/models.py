@@ -1,20 +1,31 @@
+from typing import Annotated
+
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Field,
     field_validator,
 )
+
+ItemPrice = Annotated[
+    float,
+    Field(
+        ge=0,
+        allow_inf_nan=False,
+    ),
+]
 
 
 class CreateOrReplaceItemRequest(BaseModel):
     name: str
-    price: float
+    price: ItemPrice
 
 
 class PartiallyUpdateItemRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = None
-    price: float | None = None
+    price: ItemPrice | None = None
 
     @field_validator(
         "name",

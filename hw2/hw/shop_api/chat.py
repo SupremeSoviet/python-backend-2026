@@ -76,6 +76,8 @@ async def join_chat_and_relay_messages_to_other_members(
                 message=f"{random_username} :: {message}",
             )
     except WebSocketDisconnect:
+        pass
+    finally:
         chat_rooms_broadcaster.leave_chat(
             chat_name=chat_name,
             websocket=websocket,

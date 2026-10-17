@@ -1,8 +1,27 @@
 services:
   shop:
     build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://shop:shop@postgres:5432/shop
     ports:
       - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD: shop
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shop"]
+      interval: 2s
+      retries: 15
 
   prometheus:
     image: prom/prometheus
@@ -21,3 +40,6 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+
+volumes:
+  postgres_data:

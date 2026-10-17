@@ -1,3 +1,4 @@
+import os
 from http import HTTPStatus
 
 from fastapi import (
@@ -19,7 +20,7 @@ from shop_api.models import (
     Item,
     PartiallyUpdateItemRequest,
 )
-from shop_api.storage import InMemoryShopStorage
+from shop_api.storage import DatabaseShopStorage
 
 app = FastAPI(title="Shop API")
 app.include_router(chat_router)
@@ -28,7 +29,7 @@ Instrumentator(
     excluded_handlers=["/metrics", "/docs", "/openapi.json"],
 ).instrument(app).expose(app)
 
-storage = InMemoryShopStorage()
+storage = DatabaseShopStorage(database_url=os.environ["DATABASE_URL"])
 
 
 def _get_not_deleted_item_or_raise_404(
@@ -43,14 +44,16 @@ def _get_not_deleted_item_or_raise_404(
     return item
 
 
-def _raise_404_if_cart_does_not_exist(
+def _get_cart_or_raise_404(
     cart_id: int,
-) -> None:
-    if not storage.cart_exists(cart_id=cart_id):
+) -> Cart:
+    cart = storage.get_cart_by_id(cart_id=cart_id)
+    if cart is None:
         raise HTTPException(
             status_code=HTTPStatus.NOT_FOUND,
             detail=f"cart {cart_id} not found",
         )
+    return cart
 
 
 @app.post(
@@ -69,8 +72,7 @@ def create_empty_cart(
 def get_cart_by_id(
     cart_id: int,
 ) -> Cart:
-    _raise_404_if_cart_does_not_exist(cart_id=cart_id)
-    return storage.build_cart_with_current_prices(cart_id=cart_id)
+    return _get_cart_or_raise_404(cart_id=cart_id)
 
 
 @app.get("/cart")
@@ -82,19 +84,14 @@ def get_carts_page_filtered_by_price_and_quantity(
     min_quantity: NonNegativeInt | None = None,
     max_quantity: NonNegativeInt | None = None,
 ) -> list[Cart]:
-    carts_matching_filters = []
-    for cart in storage.build_all_carts_with_current_prices():
-        total_quantity_of_items_in_cart = sum(item_in_cart.quantity for item_in_cart in cart.items)
-        if min_price is not None and cart.price < min_price:
-            continue
-        if max_price is not None and cart.price > max_price:
-            continue
-        if min_quantity is not None and total_quantity_of_items_in_cart < min_quantity:
-            continue
-        if max_quantity is not None and total_quantity_of_items_in_cart > max_quantity:
-            continue
-        carts_matching_filters.append(cart)
-    return carts_matching_filters[offset : offset + limit]
+    return storage.list_carts_page_filtered_by_price_and_quantity(
+        offset=offset,
+        limit=limit,
+        min_price=min_price,
+        max_price=max_price,
+        min_quantity=min_quantity,
+        max_quantity=max_quantity,
+    )
 
 
 @app.post("/cart/{cart_id}/add/{item_id}")
@@ -102,13 +99,17 @@ def add_item_to_cart(
     cart_id: int,
     item_id: int,
 ) -> Cart:
-    _raise_404_if_cart_does_not_exist(cart_id=cart_id)
+    if not storage.cart_exists(cart_id=cart_id):
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND,
+            detail=f"cart {cart_id} not found",
+        )
     _get_not_deleted_item_or_raise_404(item_id=item_id)
     storage.increase_item_quantity_in_cart_by_one(
         cart_id=cart_id,
         item_id=item_id,
     )
-    return storage.build_cart_with_current_prices(cart_id=cart_id)
+    return _get_cart_or_raise_404(cart_id=cart_id)
 
 
 @app.post(
@@ -139,14 +140,13 @@ def get_items_page_filtered_by_price(
     max_price: NonNegativeFloat | None = None,
     show_deleted: bool = False,
 ) -> list[Item]:
-    items_matching_filters = [
-        item
-        for item in storage.get_all_items_including_deleted()
-        if (show_deleted or not item.deleted)
-        and (min_price is None or item.price >= min_price)
-        and (max_price is None or item.price <= max_price)
-    ]
-    return items_matching_filters[offset : offset + limit]
+    return storage.list_items_page_filtered_by_price(
+        offset=offset,
+        limit=limit,
+        min_price=min_price,
+        max_price=max_price,
+        show_deleted=show_deleted,
+    )
 
 
 @app.put("/item/{item_id}")
@@ -154,10 +154,16 @@ def replace_item_by_id(
     item_id: int,
     replacement_item_data: CreateOrReplaceItemRequest,
 ) -> Item:
-    item = _get_not_deleted_item_or_raise_404(item_id=item_id)
-    item.name = replacement_item_data.name
-    item.price = replacement_item_data.price
-    return item
+    replaced_item = storage.update_item_fields_by_id(
+        item_id=item_id,
+        changed_item_fields=replacement_item_data.model_dump(),
+    )
+    if replaced_item is None or replaced_item.deleted:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND,
+            detail=f"item {item_id} not found",
+        )
+    return replaced_item
 
 
 @app.patch(
@@ -168,7 +174,10 @@ def partially_update_item_by_id(
     item_id: int,
     changed_item_fields: PartiallyUpdateItemRequest,
 ) -> Item | Response:
-    item = storage.get_item_by_id(item_id=item_id)
+    item = storage.update_item_fields_by_id(
+        item_id=item_id,
+        changed_item_fields=changed_item_fields.model_dump(exclude_unset=True),
+    )
     if item is None:
         raise HTTPException(
             status_code=HTTPStatus.NOT_FOUND,
@@ -176,13 +185,6 @@ def partially_update_item_by_id(
         )
     if item.deleted:
         return Response(status_code=HTTPStatus.NOT_MODIFIED)
-
-    for field_name, new_value in changed_item_fields.model_dump(exclude_unset=True).items():
-        setattr(
-            item,
-            field_name,
-            new_value,
-        )
     return item
 
 
@@ -190,11 +192,10 @@ def partially_update_item_by_id(
 def mark_item_as_deleted_by_id(
     item_id: int,
 ) -> Item:
-    item = storage.get_item_by_id(item_id=item_id)
+    item = storage.mark_item_as_deleted_by_id(item_id=item_id)
     if item is None:
         raise HTTPException(
             status_code=HTTPStatus.NOT_FOUND,
             detail=f"item {item_id} not found",
         )
-    item.deleted = True
     return item
